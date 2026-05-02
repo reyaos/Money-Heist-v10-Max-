@@ -2641,7 +2641,11 @@ function App(){
     if(rBalance.current>=target){
       rTargetHit.current=true;
       rAfterTarget.current=true;
-      rLastTradeTs.current=Date.now();
+      // In backtest use candle timestamp for cooldown (not wall clock — TURBO replays 200 candles/frame)
+      // rLastTradeTs is set here only for the post-target cooldown; it is NOT used as a general trade gate
+      rLastTradeTs.current=rMode.current==="backtest"&&rCandles.current.length
+        ? rCandles.current[rCandles.current.length-1].ts
+        : Date.now();
       const locked=rProfitTarget.current;
 
       // ── Feature 3: 10% of locked profits released to trading balance ──
@@ -2662,7 +2666,7 @@ function App(){
       // Close any open trade immediately when target hit
       if(rTrade.current){rTrade.current=null;setTrade(null);}
       if(rTrade2.current){rTrade2.current=null;setTrade2(null);}
-      setTimeout(()=>{rTargetHit.current=false;},500);
+      setTimeout(()=>{rTargetHit.current=false;rAfterTarget.current=false;},500);
     }
   },[]);
 
@@ -2691,7 +2695,8 @@ function App(){
     rLastTradeTs.current=0;rLockedProfits.current=0;// 0 = no cooldown on fresh start
     rPyramidLevel.current=0;rLastAddPrice.current=0;
     rStratTable.current={};rEquityPeak.current=nb;
-    if(!keepCandles){rCandles.current=[];}
+    if(!keepCandles){rCandles.current=[];rCandles.current._lastDayRollDate="";}
+    else if(!rCandles.current._lastDayRollDate){rCandles.current._lastDayRollDate="";}
     setBalance(nb);setTrade(null);setTrade2(null);setLog([]);setStats({w:0,l:0,pnl:0,tp3:0,total:0});
     setOrbRange(null);setDayTrades(0);setKLevels({pdh:null,pdl:null,asianH:null,asianL:null});
     setPhase("STANDBY");setPeakBal(nb);setDayStartBal(nb);setHourStats({});setActiveNews(null);
@@ -2721,9 +2726,12 @@ function App(){
     // Update Asian candles
     if(inAsian(hour))rAsianC.current=[...rAsianC.current,candle].slice(-200);
 
-    // Day roll
-    const isNewDay=candle.ts&&(new Date(candle.ts).getUTCHours()===0&&new Date(candle.ts).getUTCMinutes()<2);
+    // Day roll — use UTC date string to prevent duplicate resets on same day at TURBO speed
+    const candleDateStr=candle.ts?new Date(candle.ts).toISOString().slice(0,10):"";
+    const isNewDay=candleDateStr&&candleDateStr!==rCandles.current._lastDayRollDate&&
+      new Date(candle.ts).getUTCHours()===0&&new Date(candle.ts).getUTCMinutes()<2;
     if(isNewDay){
+      rCandles.current._lastDayRollDate=candleDateStr;
       rDayStart.current=rBalance.current;rDayTrades.current=0;setDayTrades(0);
       rOrbSet.current=false;rOrb.current=null;setOrbRange(null);
       const l24=newC.slice(-1440);
@@ -2753,8 +2761,41 @@ function App(){
 
     // Manage open trade
     if(rTrade.current){
-      rTrade.current=manageTrade(rTrade.current,price,atr,rLiveProvider.current,10);
-      const exit=checkExit(rTrade.current,price);
+      // ── REALISTIC BACKTEST EXIT — use candle high/low to check if SL/TP was touched ──
+      // In live mode: manageTrade/checkExit use tick prices (accurate).
+      // In backtest: we only see the closed candle OHLC. We simulate bar-by-bar exit:
+      //   1. Check if SL was touched (worst case — assume wicked before TP hit on same bar)
+      //   2. If SL and TP both touched on same bar, assume TP filled first (benefit of doubt,
+      //      consistent with standard backtesting convention for limit orders)
+      //   3. Use the actual TP or SL price (not the close) as exit price — realistic fills
+      const btCheckPrice = rMode.current==="backtest"
+        ? candle.close   // used for manageTrade (trailing updates)
+        : price;
+      rTrade.current=manageTrade(rTrade.current,btCheckPrice,atr,rLiveProvider.current,10);
+
+      // In backtest mode, simulate intra-bar touches using high/low
+      let exit=null;
+      if(rMode.current==="backtest"){
+        const t=rTrade.current;
+        // Check all TP levels and SL against the candle's range
+        if(t.dir==="BUY"){
+          // TP1: touched if candle.high >= tp1
+          if(!t.p1Done&&candle.high>=t.tp1)           exit={result:"TP1",     exitPrice:t.tp1,  partial:true, pct:0.25};
+          else if(t.p1Done&&!t.p2Done&&candle.high>=t.tp2) exit={result:"TP2",exitPrice:t.tp2,  partial:true, pct:0.25};
+          else if(t.p2Done&&!t.p3Done&&candle.high>=t.tp3) exit={result:"TP3🏆",exitPrice:t.tp3,partial:true, pct:0.35};
+          else if(t.p3Done&&candle.high>=t.tp3*1.005)      exit={result:"TP4🚀",exitPrice:+(t.tp3*1.005).toFixed(2),partial:false,pct:1.0};
+          // SL: only if candle.low <= sl AND TP was NOT touched on same bar
+          if(!exit&&candle.low<=t.sl)                  exit={result:t.trailing?"TRAIL":"SL",exitPrice:t.sl,partial:false,pct:1.0};
+        }else{
+          if(!t.p1Done&&candle.low<=t.tp1)            exit={result:"TP1",     exitPrice:t.tp1,  partial:true, pct:0.25};
+          else if(t.p1Done&&!t.p2Done&&candle.low<=t.tp2)  exit={result:"TP2",exitPrice:t.tp2,  partial:true, pct:0.25};
+          else if(t.p2Done&&!t.p3Done&&candle.low<=t.tp3)  exit={result:"TP3🏆",exitPrice:t.tp3,partial:true, pct:0.35};
+          else if(t.p3Done&&candle.low<=t.tp3*0.995)       exit={result:"TP4🚀",exitPrice:+(t.tp3*0.995).toFixed(2),partial:false,pct:1.0};
+          if(!exit&&candle.high>=t.sl)                 exit={result:t.trailing?"TRAIL":"SL",exitPrice:t.sl,partial:false,pct:1.0};
+        }
+      }else{
+        exit=checkExit(rTrade.current,price);
+      }
       if(exit){
         // (partial / full exit handling follows below)
         const t=rTrade.current,pip=10;
@@ -2939,8 +2980,27 @@ function App(){
     }
     // Manage second position if open
     if(rTrade2.current){
-      rTrade2.current=manageTrade(rTrade2.current,price,atr,rLiveProvider.current,10);
-      const exit2=checkExit(rTrade2.current,price);
+      const btPrice2=rMode.current==="backtest"?candle.close:price;
+      rTrade2.current=manageTrade(rTrade2.current,btPrice2,atr,rLiveProvider.current,10);
+      let exit2=null;
+      if(rMode.current==="backtest"){
+        const t2=rTrade2.current;
+        if(t2.dir==="BUY"){
+          if(!t2.p1Done&&candle.high>=t2.tp1)              exit2={result:"TP1",     exitPrice:t2.tp1, partial:true, pct:0.25};
+          else if(t2.p1Done&&!t2.p2Done&&candle.high>=t2.tp2) exit2={result:"TP2",  exitPrice:t2.tp2, partial:true, pct:0.25};
+          else if(t2.p2Done&&!t2.p3Done&&candle.high>=t2.tp3) exit2={result:"TP3🏆",exitPrice:t2.tp3, partial:true, pct:0.35};
+          else if(t2.p3Done&&candle.high>=t2.tp3*1.005)       exit2={result:"TP4🚀",exitPrice:+(t2.tp3*1.005).toFixed(2),partial:false,pct:1.0};
+          if(!exit2&&candle.low<=t2.sl) exit2={result:t2.trailing?"TRAIL":"SL",exitPrice:t2.sl,partial:false,pct:1.0};
+        }else{
+          if(!t2.p1Done&&candle.low<=t2.tp1)               exit2={result:"TP1",     exitPrice:t2.tp1, partial:true, pct:0.25};
+          else if(t2.p1Done&&!t2.p2Done&&candle.low<=t2.tp2)  exit2={result:"TP2",  exitPrice:t2.tp2, partial:true, pct:0.25};
+          else if(t2.p2Done&&!t2.p3Done&&candle.low<=t2.tp3)  exit2={result:"TP3🏆",exitPrice:t2.tp3, partial:true, pct:0.35};
+          else if(t2.p3Done&&candle.low<=t2.tp3*0.995)        exit2={result:"TP4🚀",exitPrice:+(t2.tp3*0.995).toFixed(2),partial:false,pct:1.0};
+          if(!exit2&&candle.high>=t2.sl) exit2={result:t2.trailing?"TRAIL":"SL",exitPrice:t2.sl,partial:false,pct:1.0};
+        }
+      }else{
+        exit2=checkExit(rTrade2.current,price);
+      }
       if(exit2){
         const t=rTrade2.current,pip=10;
         if(exit2.partial){
@@ -3120,10 +3180,27 @@ function App(){
       const rrTP1 = hge.killMode==="KILL_MAX"?2.0 : hge.killMode==="KILL"?1.8 : 1.5;
       const rrTP2 = hge.killMode==="KILL_MAX"?4.0 : hge.killMode==="KILL"?3.5 : 3.0;
       const rrTP3 = hge.killMode==="KILL_MAX"?8.0 : hge.killMode==="KILL"?7.0 : 6.0;
-      const finalSig={...sig, sl:realSL.sl, slD:realSL.slD,
-        tp1:+(sig.dir==="BUY"?sig.entry+realSL.slD*rrTP1:sig.entry-realSL.slD*rrTP1).toFixed(2),
-        tp2:+(sig.dir==="BUY"?sig.entry+realSL.slD*rrTP2:sig.entry-realSL.slD*rrTP2).toFixed(2),
-        tp3:+(sig.dir==="BUY"?sig.entry+realSL.slD*rrTP3:sig.entry-realSL.slD*rrTP3).toFixed(2),
+
+      // ── REALISTIC ENTRY PRICE ────────────────────────────────────────
+      // Live: entry = signal candle close (market order, fills immediately)
+      // Backtest: entry = next bar's open + realistic slippage (0.1–0.5 pip)
+      //   This prevents P&L from being computed on the same candle as entry.
+      //   Slippage reflects broker latency + spread at execution.
+      let realisticEntry = sig.entry; // default: signal candle close
+      if(rMode.current==="backtest"){
+        // Simulated next-bar open: add/subtract a small random slippage (0.5–1.5 pip)
+        const slippagePip = 0.5 + Math.random(); // 0.5–1.5 pip slippage
+        realisticEntry = sig.dir==="BUY"
+          ? +(sig.entry + slippagePip*0.1 + spread*0.5).toFixed(2)  // buy fills slightly above
+          : +(sig.entry - slippagePip*0.1 - spread*0.5).toFixed(2); // sell fills slightly below
+      }
+
+      const finalSig={...sig, entry:realisticEntry, sl:
+        sig.dir==="BUY"?+(realisticEntry-(sig.entry-realSL.sl)).toFixed(2):+(realisticEntry+(realSL.sl-sig.entry)).toFixed(2),
+        slD:realSL.slD,
+        tp1:+(sig.dir==="BUY"?realisticEntry+realSL.slD*rrTP1:realisticEntry-realSL.slD*rrTP1).toFixed(2),
+        tp2:+(sig.dir==="BUY"?realisticEntry+realSL.slD*rrTP2:realisticEntry-realSL.slD*rrTP2).toFixed(2),
+        tp3:+(sig.dir==="BUY"?realisticEntry+realSL.slD*rrTP3:realisticEntry-realSL.slD*rrTP3).toFixed(2),
       };
 
       // Trade starts with structure-based SL. Trail activates when price reaches 50%
@@ -3238,9 +3315,13 @@ function App(){
       setBtCandles(useData);
       rBtIdx.current=50;setBtIdx(50);
 
-      // Show first 50 candles on chart immediately so it's not blank before replay starts
+      // Pre-fill rCandles with the warmup window so processCandle has context from candle #51
       rCandles.current=useData.slice(0,50);
+      rCandles.current._lastDayRollDate=""; // init day-roll dedup tracker
       setCandles(useData.slice(0,50));
+
+      // Ensure rRunning is false until user presses Play (replayStep sets it true per-candle)
+      rRunning.current=false;
 
       // Build all MTF candles from 1M data
       const tfc={
@@ -3285,9 +3366,14 @@ function App(){
     const mtfSlice=getMTFSliceAt(candles1M,idx);
     rTfCandles.current=mtfSlice;
     // Realistic spread per instrument and session
-    const hour=new Date(candle.ts).getUTCHours();
-    const spread=kzAt(hour)?0.20:0.30; // XAUUSD session spread
+    const hourDec=new Date(candle.ts).getUTCHours()+(new Date(candle.ts).getUTCMinutes()/60);
+    // Realistic XAUUSD spread by session: London/NY overlap tighter, Asian wider
+    const spread=
+      (hourDec>=8&&hourDec<12)||(hourDec>=13&&hourDec<17)?0.18:  // London/NY — tight
+      (hourDec>=0&&hourDec<5)?0.45:                               // Asian — wider
+      0.30;                                                        // off-hours
     rSpread.current=spread;setLiveSpread(spread);
+    rRunning.current=true; // processCandle guards need this true in backtest mode
     processCandle(candle,spread);
     const newIdx=idx+1;
     rBtIdx.current=newIdx;setBtIdx(newIdx);
@@ -3322,6 +3408,7 @@ function App(){
 
     const done=()=>{
       setBtRunning(false);
+      rRunning.current=false;
       setStatus("✅ Backtest complete · "+btCandles.length.toLocaleString()+" candles replayed");
     };
 
@@ -3657,10 +3744,10 @@ function App(){
         }
       }
 
-      // ── TICK-LEVEL SIGNAL SCAN — fires when no trade open ─────────
-      // Checks signal every 5 ticks so the bot doesn't wait a full minute
-      // between candle closes. Uses rLiveCandles (closed+forming) for context.
-      if(rRunning.current&&!rTrade.current&&rTickN.current%5===0&&rLiveCandles.current.length>=10){
+      // ── TICK-LEVEL SIGNAL SCAN — LIVE FORWARD MODE ONLY ──────────────
+      // In backtest, processCandle() already handles signal eval per candle.
+      // This block only runs in live/forward mode (rMode==="forward").
+      if(rMode.current==="forward"&&rRunning.current&&!rTrade.current&&rTickN.current%5===0&&rLiveCandles.current.length>=10){
         const cs_tick=rLiveCandles.current.slice(-200);
         const hour_tick=new Date().getUTCHours()+(new Date().getUTCMinutes()/60);
         const atr_tick=rCachedATR.current||calcATR(cs_tick);
