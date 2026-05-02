@@ -4042,8 +4042,8 @@ function App(){
         /* Chart tab — fixed layout, chart never shifts */
         <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",padding:"6px 10px",gap:"4px"}}>
 
-          {/* START button — shown when not running */}
-          {!running&&(
+          {/* START button — shown only when truly idle (not live, not backtest) */}
+          {!running && mode!=="backtest" &&(
             <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"16px"}}>
               <div style={{fontSize:"40px"}}>💰</div>
               <div style={{fontSize:"14px",fontWeight:"700",color:GOLD,letterSpacing:"1px"}}>MONEY HEIST v10</div>
@@ -4057,10 +4057,78 @@ function App(){
             </div>
           )}
 
-      {/* Chart — shown when running */}
-      {running&&(
+          {/* Backtest idle — candles not loaded yet */}
+          {!running && mode==="backtest" && btCandles.length===0 &&(
+            <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"12px"}}>
+              <div style={{fontSize:"36px"}}>⏪</div>
+              <div style={{fontSize:"13px",fontWeight:"700",color:PURPLE,letterSpacing:"1px"}}>BACKTEST MODE</div>
+              <div style={{fontSize:"10px",color:DIM,textAlign:"center",lineHeight:"1.6"}}>
+                Go to <span style={{color:TEXT,fontWeight:"600"}}>Mode tab</span> → pick a date range →<br/>
+                press <span style={{color:PURPLE,fontWeight:"600"}}>📡 Fetch Real XAU/USD Candles</span>
+              </div>
+            </div>
+          )}
+
+      {/* Chart — shown when live running OR backtest has candles */}
+      {(running || (mode==="backtest" && btCandles.length>0)) &&(
             <div style={{flex:1,minHeight:0,display:"flex",flexDirection:"column"}}>
               <ChartFill candles={candles} trade={trade} livePrice={livePrice} replayIdx={null} rLiveCandles={rLiveCandles} mode={mode}/>
+            </div>
+          )}
+
+          {/* ── INLINE BACKTEST CONTROLS on chart tab ── */}
+          {mode==="backtest" && btCandles.length>0 &&(
+            <div style={{flexShrink:0,display:"flex",flexDirection:"column",gap:"4px",paddingTop:"4px"}}>
+              {/* Progress bar */}
+              <div style={{height:"2px",background:"#1a1a2a",borderRadius:"1px",overflow:"hidden"}}>
+                <div style={{height:"100%",background:`linear-gradient(90deg,${PURPLE},${RED})`,
+                  width:`${Math.min(btIdx/btCandles.length*100,100).toFixed(1)}%`,transition:"width .3s"}}/>
+              </div>
+              {/* Controls row */}
+              <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
+                <button onClick={()=>setBtRunning(r=>!r)}
+                  style={{padding:"5px 14px",borderRadius:"6px",fontWeight:"700",fontSize:"11px",cursor:"pointer",
+                    background:btRunning?PURPLE+"22":PURPLE,border:`1px solid ${PURPLE}`,color:btRunning?PURPLE:TEXT}}>
+                  {btRunning?"⏸":"▶"}
+                </button>
+                <button onClick={()=>replayStep(btCandles)}
+                  style={{padding:"5px 10px",borderRadius:"6px",fontSize:"11px",cursor:"pointer",
+                    background:"transparent",border:`1px solid ${BORDER}`,color:MUTED}}>
+                  ▶|
+                </button>
+                <button onClick={()=>{setBtRunning(false);resetAllState(rStartBal.current,true);rBtIdx.current=50;setBtIdx(50);setCandles(btCandles.slice(0,50));setStatus("↺ Reset · Press ▶ to replay");}}
+                  style={{padding:"5px 10px",borderRadius:"6px",fontSize:"11px",cursor:"pointer",
+                    background:"transparent",border:`1px solid ${BORDER}`,color:MUTED}}>
+                  ↺
+                </button>
+                <div style={{flex:1,fontSize:"8px",fontFamily:"'JetBrains Mono',monospace",color:DIM,overflow:"hidden",whiteSpace:"nowrap",textOverflow:"ellipsis"}}>
+                  {btCandles[btIdx-1]?.ts ? new Date(btCandles[btIdx-1].ts).toLocaleString() : "–"}
+                </div>
+                <span style={{fontSize:"8px",color:PURPLE,fontFamily:"'JetBrains Mono',monospace",flexShrink:0}}>
+                  {btIdx}/{btCandles.length}
+                </span>
+                {/* Speed pills */}
+                {[{l:"T",ms:0},{l:"M",ms:10},{l:"F",ms:50},{l:"N",ms:500}].map(({l,ms})=>(
+                  <button key={ms} onClick={()=>{setReplaySpeed(ms);rReplaySpeed.current=ms;}}
+                    style={{padding:"3px 7px",borderRadius:"4px",fontSize:"8px",fontWeight:"700",cursor:"pointer",
+                      border:`1px solid ${replaySpeed===ms?PURPLE:BORDER}`,
+                      background:replaySpeed===ms?PURPLE+"22":"transparent",
+                      color:replaySpeed===ms?PURPLE:DIM}}>
+                    {l}
+                  </button>
+                ))}
+              </div>
+              {/* Live stats strip */}
+              {stats.total>0&&(
+                <div style={{display:"flex",gap:"8px",fontSize:"8px",fontFamily:"'JetBrains Mono',monospace",padding:"3px 0"}}>
+                  <span style={{color:stats.pnl>=0?GREEN:RED,fontWeight:"700"}}>{stats.pnl>=0?"+":""}${stats.pnl.toFixed(2)}</span>
+                  <span style={{color:DIM}}>WR:<span style={{color:wr>55?GREEN:wr>45?GOLD:RED}}>{wr}%</span></span>
+                  <span style={{color:DIM}}>{stats.w}W·{stats.l}L</span>
+                  <span style={{color:GOLD}}>🏆{stats.tp3}</span>
+                  <span style={{color:dd>15?RED:dd>8?GOLD:DIM}}>DD:{dd}%</span>
+                  <span style={{color:balance>=startBal?GREEN:RED,fontWeight:"700"}}>${balance.toFixed(2)}</span>
+                </div>
+              )}
             </div>
           )}
         </div>
