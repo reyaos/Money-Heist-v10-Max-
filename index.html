@@ -379,33 +379,48 @@ let _hgeLastReset  = 0;          // UTC date of last day-reset
 
 // ── HGEv5 PRECISION GATE ───────────────────────────────────────────
 // Returns {allow:bool, reason:string}
-// Called BEFORE masterSignal's final decision in processCandle.
+// Called BEFORE lot sizing in processCandle — filters noise, not valid PA setups.
+//
+// KEY PRINCIPLE: The 30-strategy PA engine already has strict entry conditions.
+// These gates add LIGHT extra filtering only — they must NOT block breakouts,
+// momentum continuation, SMC breaks, ORB, or any setup that fires near extremes.
 function hgePrecisionGate({cs, dir, entry, atr, mktState}){
   if(!cs||cs.length<3) return {allow:true};
 
-  // Gate 1: Blown candle filter (HGEv5)
+  // Gate 1: Extreme blown-candle filter — only block truly abnormal candles (3× avg)
+  // Was 1.5× — too tight, blocked valid high-momentum entries on news/London open
   const last=cs[cs.length-1];
   const prevArr=cs.slice(-8,-1);
   const avgRange=prevArr.reduce((s,c)=>s+c.range,0)/Math.max(prevArr.length,1);
-  if(avgRange>0 && last.range>avgRange*1.5) return {allow:false, reason:"blown_candle"};
+  if(avgRange>0 && last.range>avgRange*3.0) return {allow:false, reason:"blown_candle"};
 
-  // Gate 2: Pullback zone filter (HGEv5) — only in TRENDING markets
-  if(mktState==="TRENDING"){
+  // Gate 2: Pullback zone — REMOVED for TRENDING markets
+  // Breakouts, SMC, ORB, and momentum continuation all fire at range extremes (top/bottom 30%).
+  // Restricting to middle 40% of range kills the highest-conviction trend setups.
+  // Only apply a very wide zone check in RANGING markets to avoid chasing extremes.
+  if(mktState==="RANGING"){
     const window=cs.slice(-20);
     const recHigh=Math.max(...window.map(c=>c.high));
     const recLow =Math.min(...window.map(c=>c.low));
     const range=recHigh-recLow;
-    if(range>atr*0.5){
+    if(range>atr*1.0){
       const pos=(entry-recLow)/range;
-      if(pos<0.30 || pos>0.70) return {allow:false, reason:"outside_zone"};
+      // In ranging: only skip if price is within 10% of absolute extreme (fading into wall)
+      if(pos<0.10 || pos>0.90) return {allow:false, reason:"outside_zone"};
     }
   }
 
-  // Gate 3: Rejection confirmation (HGEv5)
+  // Gate 3: Rejection confirmation — RELAXED
+  // Original: BUY requires entry > prevClose on EVERY candle. This blocks:
+  //   - Inside bar breakouts (entry = mother bar close)
+  //   - Consolidation breakouts (flat candles, same close)
+  //   - Any entry on first candle after a pullback
+  // New: only block if price is CLEARLY moving against the trade direction
+  // (more than 0.25×ATR adverse move from prevClose)
   const prevClose=cs[cs.length-2]?.close;
-  if(prevClose){
-    if(dir==="BUY"  && entry<=prevClose) return {allow:false, reason:"no_bull_rejection"};
-    if(dir==="SELL" && entry>=prevClose) return {allow:false, reason:"no_bear_rejection"};
+  if(prevClose && atr>0){
+    if(dir==="BUY"  && entry < prevClose - atr*0.25) return {allow:false, reason:"no_bull_rejection"};
+    if(dir==="SELL" && entry > prevClose + atr*0.25) return {allow:false, reason:"no_bear_rejection"};
   }
 
   return {allow:true};
@@ -687,21 +702,27 @@ function ultraLotMult(score, balance){
 
 // ── HGEv5 INTEGRATED FILTER — replaces old hgeFilter ────────────────
 // Runs AFTER masterSignal, BEFORE lot sizing.
-// Adds: ATR regime check, equity guard, Kill mode update,
-//       + exposes killMode / equityGuard state for status display.
+// Adds: ATR regime check, equity guard, Kill mode update.
 // Returns {allow:bool, riskMult:number, pyramidOk:bool, regime, killMode}
 function hgeFilter({atrNow, atrAvg, voteStrength, mktState, balance, equityPeak,
                     dayStartBal, lastTrades, hourGMT, cs, dir, entry, atr}){
 
-  // 1. ATR Regime (from original HTML)
+  // 1. ATR Regime — only block truly dead markets (< 60% of avg, not 80%)
+  // 80% was too aggressive — catches normal quiet periods between sessions
   const regime=detectATRRegime(atrNow, atrAvg);
-  if(regime==="dead")return{allow:false,riskMult:0,pyramidOk:false,regime,killMode:"BASE"};
+  if(atrAvg>0 && atrNow < atrAvg*0.60) return{allow:false,riskMult:0,pyramidOk:false,regime:"dead",killMode:"BASE",gateReason:"dead_atr"};
 
-  // 2. Vote agreement gate
-  if(voteStrength<0.50)return{allow:false,riskMult:0,pyramidOk:false,regime,killMode:"BASE"};
-  if(mktState==="RANGING"&&voteStrength<0.75)return{allow:false,riskMult:0,pyramidOk:false,regime,killMode:"BASE"};
+  // 2. Vote agreement gate — lowered from 50% to 35%
+  // The 30-strategy engine with SETE weights produces fractional votes.
+  // 50% floor was eliminating valid setups where one direction had 40% of votes
+  // but all from high-conviction strategies (SMC + CHoCH + Sweep = strong signal).
+  if(voteStrength<0.35) return{allow:false,riskMult:0,pyramidOk:false,regime,killMode:"BASE",gateReason:"weak_consensus"};
 
-  // 3. HGEv5 Precision Gate (new — pullback zone, candle range, rejection confirm)
+  // 3. RANGING extra filter — lowered from 75% to 55%
+  // 75% was blocking virtually everything in range. 55% still requires clear majority.
+  if(mktState==="RANGING"&&voteStrength<0.55) return{allow:false,riskMult:0,pyramidOk:false,regime,killMode:"BASE",gateReason:"ranging_weak"};
+
+  // 4. HGEv5 Precision Gate (blown candle, ranging zone, relaxed rejection)
   if(cs&&dir&&entry&&atr){
     const gate=hgePrecisionGate({cs, dir, entry, atr, mktState});
     if(!gate.allow){
@@ -709,36 +730,33 @@ function hgeFilter({atrNow, atrAvg, voteStrength, mktState, balance, equityPeak,
     }
   }
 
-  // 4. HGEv5 Equity Guard
+  // 5. HGEv5 Equity Guard — only hard stop at 20% DD
   const peak=Math.max(_hgePeakBal||equityPeak||balance, balance);
   const dd=(peak-balance)/Math.max(peak,0.01);
-  if(dd>0.20)return{allow:false,riskMult:0,pyramidOk:false,regime,killMode:_hgeKillMode,gateReason:"equity_guard_stop"};
+  if(dd>0.20) return{allow:false,riskMult:0,pyramidOk:false,regime,killMode:_hgeKillMode,gateReason:"equity_guard_stop"};
 
-  // 5. Update Kill Mode tier (HGEv5)
+  // 6. Update Kill Mode tier
   const killMode=hgeUpdateKillMode({
     balance, dayStartBal:dayStartBal||balance,
     lastTrades:lastTrades||[], hour:hourGMT||12, mktState
   });
 
-  // 6. HGEv5 Daily lock-in (100% day gain → stop)
+  // 7. Daily lock-in (100% day gain)
   const dayPnL=(balance-(dayStartBal||balance))/Math.max(dayStartBal||balance,0.01);
-  if(dayPnL>1.0)return{allow:false,riskMult:0,pyramidOk:false,regime,killMode,gateReason:"daily_lock"};
+  if(dayPnL>1.0) return{allow:false,riskMult:0,pyramidOk:false,regime,killMode,gateReason:"daily_lock"};
 
-  // 7. Composite risk multiplier
+  // 8. Composite risk multiplier
   let eqMult=1.0;
-  if(dd>0.10)       eqMult=0.50;  // REDUCE
-  else if(dd<=0.02) eqMult=1.15;  // above peak equity
+  if(dd>0.10)       eqMult=0.50;
+  else if(dd<=0.02) eqMult=1.15;
 
   let stateMult=1.0;
   if(regime==="expansion") stateMult=1.30;
-  if(mktState==="RANGING")  stateMult=0.70;
+  if(mktState==="RANGING")  stateMult=0.75;
 
-  // Kill mode multiplier feeds into riskMult for the upstream composite calc
   const killMult = killMode==="KILL_MAX"?1.60 : killMode==="KILL"?1.30 : 1.0;
-
   const riskMult=Math.min(eqMult*stateMult*killMult, 3.5);
-  const pyramidOk=(regime==="expansion"&&mktState!=="RANGING") ||
-                  (killMode==="KILL_MAX");
+  const pyramidOk=(regime==="expansion"&&mktState!=="RANGING")||(killMode==="KILL_MAX");
 
   return{allow:true,riskMult,pyramidOk,regime,killMode,equityGuard:dd>0.10?"REDUCE":"NORMAL"};
 }
@@ -2853,7 +2871,9 @@ function App(){
             pnl:+(rStats.current.pnl+pnl).toFixed(2),tp3:rStats.current.tp3+(exit.result==="TP3🏆"?1:0),total:rStats.current.total+1};
           setStats({...rStats.current});setBalance(rBalance.current);
           rTrade.current=null;setTrade(null);setPhase("SCANNING");
-          rLastTradeTs.current=Date.now();
+          // Use candle timestamp in backtest so 5-min cooldown works at any replay speed.
+          // In live mode Date.now() is correct. In backtest candle.ts is the real market time.
+          rLastTradeTs.current=candle.ts||Date.now();
           rEquityH.current=[...rEquityH.current,rBalance.current].slice(-500);setEquityHist([...rEquityH.current]);
           const icon=exit.result==="TP3🏆"?"🏆":exit.result.startsWith("TP")?"✅":exit.result==="TRAIL"?"🎯":won?"✅":"❌";
           setLastResult({icon,text:`${exit.result} · ${t.dir} · ${won?"+":""}$${pnl.toFixed(2)}`,won});
@@ -2963,10 +2983,11 @@ function App(){
     setMktState(mState);
 
     // ── POST-TARGET COOLDOWN ONLY — never blocks on fresh start ──────
-    // rLastTradeTs is set to 0 on init/reset, so cooldown never fires at startup.
-    // It only activates after checkProfitTarget() triggers a target lock.
-    const cooldownMs=300000; // 5 min breather after target hit (was 2 min)
-    const timeSinceTrade=rLastTradeTs.current===0?Infinity:Date.now()-rLastTradeTs.current;
+    // Uses candle.ts in backtest so cooldown works at TURBO/MAX replay speeds.
+    // In live mode Date.now() is used (candle.ts may be stale by a few seconds).
+    const nowTs = (rMode.current==="backtest" && candle.ts) ? candle.ts : Date.now();
+    const cooldownMs=300000; // 5 min breather after target hit
+    const timeSinceTrade=rLastTradeTs.current===0?Infinity:nowTs-rLastTradeTs.current;
     if(rAfterTarget.current&&timeSinceTrade<cooldownMs){
       setPhase("SCANNING");
       if(rTickN.current%6===0){
